@@ -1,6 +1,6 @@
 {
     "Allow to transfer errors if the adapter crash. Private data like usernames, passwords, tokens, ... will be NOT be transferd.": "Erlaube das weiterleiten von Fehlern wenn der Adapter abstürtzt. Private Daten wie z.B. Benutzername, Passwort, Token, ... werden NICHT übertragen.",
-    "Auto update of new firmware": "Bei neuer Firmware, Update sofort ausführen",
+    "Auto update of new firmware": "Automatisches Aktualisieren von neuer Firmware.",
     "COAP listen IP": "COAP-Listen-IP",
     "CoAP and HTTP": "CoAP und HTTP",
     "CoAP settings": "CoAP-Einstellungen",
@@ -17,5 +17,8 @@
     "Poll time in seconds": "Abfragezeit in Sekunden",
     "Shelly devices that shall not be displayed. Enter device id of Shelly like 8B22BD": "Shelly-Geräte, die nicht angezeigt werden sollen. Geben Sie die Geräte-ID von Shelly wie 8B22BD ein",
     "Shelly protocol": "Shelly-Protokoll",
-    "Update objects even if there is no value change": "Objekte aktualisieren, auch wenn keine Wertänderung vorliegt"
+    "Update objects even if there is no value change": "Objekte aktualisieren, auch wenn keine Wertänderung vorliegt",
+    "Log Debug Messages": "Debug-Meldungen protokollieren",
+    "Will be used to authenticate against all Shelly devices": "Wird zur Authentifizierung bei allen Shelly-Geräten verwendet",
+    "You have to configure the same password on all devices": "Sie müssen auf allen Geräten dasselbe Passwort konfigurieren"
 }

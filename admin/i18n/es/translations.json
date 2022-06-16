@@ -17,5 +17,8 @@
     "Poll time in seconds": "Tiempo de encuesta en segundos",
     "Shelly devices that shall not be displayed. Enter device id of Shelly like 8B22BD": "Dispositivos de Shelly que no se mostrarán .. Ingrese el ID de dispositivo de Shelly como 8B22BD",
     "Shelly protocol": "Protocolo shelly",
-    "Update objects even if there is no value change": "Actualizar objetos incluso si no hay cambio de valor"
+    "Update objects even if there is no value change": "Actualizar objetos incluso si no hay cambio de valor",
+    "Log Debug Messages": "Registrar mensajes de depuración",
+    "Will be used to authenticate against all Shelly devices": "Se usará para autenticarse en todos los dispositivos Shelly",
+    "You have to configure the same password on all devices": "Tienes que configurar la misma contraseña en todos los dispositivos"
 }

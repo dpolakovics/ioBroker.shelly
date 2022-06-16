@@ -1,12 +1,9 @@
-/* jshint -W097 */
-/* jshint strict: false */
-/* jslint node: true */
 'use strict';
 
 const utils = require('@iobroker/adapter-core');
-const objectHelper = require('@apollon/iobroker-tools').objectHelper; // Get common adapter utils
-const mqttServer = require(__dirname + '/lib/mqtt');
-const coapServer = require(__dirname + '/lib/coap');
+const objectHelper = require('@apollon/iobroker-tools').objectHelper; // Common adapter utils
+const protocolMqtt = require(__dirname + '/lib/protocol/mqtt');
+const protocolCoap = require(__dirname + '/lib/protocol/coap');
 const adapterName = require('./package.json').name.split('.').pop();
 const tcpPing = require('tcp-ping');
 const EventEmitter = require('events').EventEmitter;
@@ -19,9 +16,12 @@ class Shelly extends utils.Adapter {
             name: adapterName,
         });
 
+        this.isUnloaded = false;
+
         this.serverMqtt = null;
         this.serverCoap = null;
-        this.pollTimeout = null;
+        this.firmwareUpdateTimeout = null;
+        this.onlineCheckTimeout = null;
 
         this.onlineDevices = {};
 
@@ -37,8 +37,6 @@ class Shelly extends utils.Adapter {
 
     async onReady() {
         try {
-            this.log.info('Starting Adapter ' + this.namespace + ' in version ' + this.version);
-
             // Upgrade older config
             if (await this.migrateConfig()) {
                 return;
@@ -53,22 +51,26 @@ class Shelly extends utils.Adapter {
             await this.setOnlineFalse();
             this.onlineCheck();
 
+            this.autoFirmwareUpdate();
+
+            // Start MQTT server
             setImmediate(() => {
                 if (protocol === 'both' || protocol === 'mqtt') {
-                    this.log.info('Starting in MQTT mode. Listening on ' + this.config.bind + ':' + this.config.port);
+                    this.log.info(`Starting in MQTT mode. Listening on ${this.config.bind}:${this.config.port}`);
 
                     if (!this.config.mqttusername || this.config.mqttusername.length === 0) { this.log.error('MQTT Username is missing!'); }
                     if (!this.config.mqttpassword || this.config.mqttpassword.length === 0) { this.log.error('MQTT Password is missing!'); }
 
-                    this.serverMqtt = new mqttServer.MQTTServer(this, objectHelper, this.eventEmitter);
+                    this.serverMqtt = new protocolMqtt.MQTTServer(this, objectHelper, this.eventEmitter);
                     this.serverMqtt.listen();
                 }
             });
 
+            // Start CoAP server
             setImmediate(() => {
                 if (protocol === 'both' || protocol === 'coap') {
                     this.log.info('Starting in CoAP mode.');
-                    this.serverCoap = new coapServer.CoAPServer(this, objectHelper, this.eventEmitter);
+                    this.serverCoap = new protocolCoap.CoAPServer(this, objectHelper, this.eventEmitter);
                     this.serverCoap.listen();
                 }
             });
@@ -88,13 +90,14 @@ class Shelly extends utils.Adapter {
         if (state && !state.ack) {
             const stateId = id.replace(this.namespace + '.', '');
 
-            this.log.debug('stateChange ' + id + ' ' + JSON.stringify(state));
-            this.log.debug('stateChange ' + id + ' = ' + state.val);
-
-            objectHelper.handleStateChange(id, state);
-
             if (stateId === 'info.update') {
-                eventEmitter.emit('onFirmwareUpdate');
+                this.log.debug(`[onStateChange] "info.update" state changed - starting update on every device`);
+
+                this.eventEmitter.emit('onFirmwareUpdate');
+            } else {
+                this.log.debug(`[onStateChange] "${id}" state changed: ${JSON.stringify(state)} - forwarding to objectHelper`);
+
+                objectHelper.handleStateChange(id, state);
             }
         }
     }
@@ -104,18 +107,26 @@ class Shelly extends utils.Adapter {
     }
 
     onUnload(callback) {
-        if (this.pollTimeout) {
-            this.clearTimeout(this.pollTimeout);
-            this.pollTimeout = null;
+        this.isUnloaded = true;
+
+        if (this.onlineCheckTimeout) {
+            this.clearTimeout(this.onlineCheckTimeout);
+            this.onlineCheckTimeout = null;
         }
 
         this.setOnlineFalse();
 
+        if (this.firmwareUpdateTimeout) {
+            this.clearTimeout(this.firmwareUpdateTimeout);
+            this.firmwareUpdateTimeout = null;
+        }
+
         try {
-            this.log.info('Closing Adapter');
+            this.log.debug('[onUnload] Closing adapter');
 
             if (this.serverCoap) {
                 try {
+                    this.log.debug(`[onUnload] Stopping CoAP server`);
                     this.serverCoap.destroy();
                 } catch (err) {
                     // ignore
@@ -124,6 +135,7 @@ class Shelly extends utils.Adapter {
 
             if (this.serverMqtt) {
                 try {
+                    this.log.debug(`[onUnload] Stopping MQTT server`);
                     this.serverMqtt.destroy();
                 } catch (err) {
                     // ignore
@@ -140,9 +152,9 @@ class Shelly extends utils.Adapter {
     async onlineCheck() {
         const valPort = 80;
 
-        if (this.pollTimeout) {
-            this.clearTimeout(this.pollTimeout);
-            this.pollTimeout = null;
+        if (this.onlineCheckTimeout) {
+            this.clearTimeout(this.onlineCheckTimeout);
+            this.onlineCheckTimeout = null;
         }
 
         try {
@@ -150,45 +162,56 @@ class Shelly extends utils.Adapter {
             for (const d in deviceIds) {
                 const deviceId = deviceIds[d];
 
-                const idOnline = deviceId + '.online';
                 const idHostname = deviceId + '.hostname';
 
                 const stateHostaname = await this.getStateAsync(idHostname);
                 const valHostname = stateHostaname ? stateHostaname.val : undefined;
 
                 if (valHostname) {
-                    this.log.debug(`onlineCheck of ${idHostname} on ${valHostname}:${valPort}`);
+                    this.log.debug(`[onlineCheck] Checking ${idHostname} on ${valHostname}:${valPort}`);
 
                     tcpPing.probe(valHostname, valPort, async (error, isAlive) => {
                         this.emit('deviceStatusUpdate', deviceId, isAlive);
-
-                        const oldState = await this.getStateAsync(idOnline);
-                        const oldValue = oldState && oldState.val ? (oldState.val === 'true' || oldState.val === true) : false;
-
-                        if (oldValue != isAlive) {
-                            this.log.debug(`onlineCheck of ${idHostname} changed to ${isAlive}`);
-                            await this.setStateAsync(idOnline, { val: isAlive, ack: true });
-                        }
                     });
-
-                } else {
-                    this.log.warn(`onlineCheck of ${idHostname} failed - state is empty (no hostname)`);
                 }
             }
         } catch (e) {
             this.log.error(e.toString());
         }
 
-        this.pollTimeout = this.setTimeout(() => {
-            this.pollTimeout = null;
+        this.onlineCheckTimeout = this.setTimeout(() => {
+            this.onlineCheckTimeout = null;
             this.onlineCheck();
-        }, this.config.polltime * 1000);
+        }, 60 * 1000); // Restart online check in 60 Seconds
     }
 
     async onDeviceStatusUpdate(deviceId, status) {
-        this.log.debug(`onDeviceStatusUpdate: ${deviceId}: ${status}`);
+        if (this.isUnloaded) return;
+        if (!deviceId) return;
 
-        const oldOnlineDevices = Object.keys(this.onlineDevices).length;
+        this.log.debug(`[onDeviceStatusUpdate] ${deviceId}: ${status}`);
+
+        // Check if device object exists
+        const knownDevices = await this.getAllDevices();
+        if (knownDevices.indexOf(deviceId) === -1) {
+            this.log.silly(`[onDeviceStatusUpdate] ${deviceId} is not in list of known devices: ${JSON.stringify(knownDevices)}`);
+            return;
+        }
+
+        // Update online status
+        const idOnline = `${deviceId}.online`;
+        const onlineState = await this.getStateAsync(idOnline);
+
+        if (onlineState) {
+            const prevValue = onlineState.val ? (onlineState.val === 'true' || onlineState.val === true) : false;
+
+            if (prevValue != status) {
+                await this.setStateAsync(idOnline, { val: status, ack: true });
+            }
+        }
+
+        // Update connection state
+        const oldOnlineDeviceCount = Object.keys(this.onlineDevices).length;
 
         if (status) {
             this.onlineDevices[deviceId] = true;
@@ -196,11 +219,12 @@ class Shelly extends utils.Adapter {
             delete this.onlineDevices[deviceId];
         }
 
-        const newOnlineDevices = Object.keys(this.onlineDevices).length;
+        const newOnlineDeviceCount = Object.keys(this.onlineDevices).length;
 
         // Check online devices
-        if (oldOnlineDevices !== newOnlineDevices) {
-            if (newOnlineDevices > 0) {
+        if (oldOnlineDeviceCount !== newOnlineDeviceCount) {
+            this.log.debug(`[onDeviceStatusUpdate] Online devices: ${JSON.stringify(Object.keys(this.onlineDevices))}`);
+            if (newOnlineDeviceCount > 0) {
                 this.setStateAsync('info.connection', true, true);
             } else {
                 this.setStateAsync('info.connection', false, true);
@@ -208,37 +232,59 @@ class Shelly extends utils.Adapter {
         }
     }
 
+    isOnline(deviceId) {
+        return Object.prototype.hasOwnProperty.call(this.onlineDevices, deviceId);
+    }
+
     async getAllDevices() {
         const devices = await this.getDevicesAsync();
-        return devices.map(device => device._id);
+        return devices.map(device => this.removeNamespace(device._id));
     }
 
     async setOnlineFalse() {
         const deviceIds = await this.getAllDevices();
         for (const d in deviceIds) {
             const deviceId = deviceIds[d];
-            const idOnline = deviceId + '.online';
+            const idOnline = `${deviceId}.online`;
+            const onlineState = await this.getStateAsync(idOnline);
 
-            await this.setForeignStateAsync(idOnline, { val: false, ack: true });
-        }
-    }
+            if (onlineState) {
+                const prevValue = onlineState.val ? (onlineState.val === 'true' || onlineState.val === true) : false;
 
-    /*
-    async deleteObjects() {
-        try {
-            // delete online States
-            const idsOnline = await this.getAllDevices();
-            for (const i in idsOnline) {
-                const idOnline = idsOnline[i];
-                //let a = await this.delForeignStateAsync(idOnline);
-                const a = await this.delForeignObjectAsync(idOnline);
-                const idParent = idOnline.split('.').slice(0, -1).join('.');
+                if (prevValue) {
+                    await this.setStateAsync(idOnline, { val: false, ack: true });
+                }
             }
-        } catch (error) {
-            //
+
+            await this.extendObjectAsync(deviceId, {
+                common: {
+                    color: null // Remove color from previous versions
+                }
+            });
+        }
+
+        this.onlineDevices = {};
+        this.setStateAsync('info.connection', false, true);
+    }
+
+    autoFirmwareUpdate() {
+        if (this.isUnloaded) return;
+        if (this.config.autoupdate) {
+            this.log.debug(`[firmwareUpdate] Auto-Update enabled - starting update on every device`);
+
+            this.eventEmitter.emit('onFirmwareUpdate');
+
+            this.firmwareUpdateTimeout = this.setTimeout(() => {
+                this.firmwareUpdateTimeout = null;
+                this.autoFirmwareUpdate();
+            }, 15 * 60 * 1000); // Restart firmware update in 60 Seconds
         }
     }
-    */
+
+    removeNamespace(id) {
+        const re = new RegExp(this.namespace + '*\\.', 'g');
+        return id.replace(re, '');
+    }
 
     async migrateConfig() {
         const native = {};
@@ -259,14 +305,14 @@ class Shelly extends utils.Adapter {
             native.password = '';
         }
         if (this.config.keys) {
-            native.blacklist = this.config.keys.map(b => { return { id: b.blacklist } });
+            native.blacklist = this.config.keys.map(b => { return { id: b.blacklist }; });
             native.keys = null;
         }
 
         if (Object.keys(native).length) {
             this.log.info('Migrate some data from old Shelly Adapter version. Restarting Shelly Adapter now!');
             await this.extendForeignObjectAsync('system.adapter.' + this.namespace, { native: native });
-            
+
             return true;
         }
 
